@@ -1,4 +1,4 @@
-# VERSION: 1.24
+# VERSION: 1.25
 # AUTHORS: bebetoh, mvsantss
 # WEBSITE: https://apachetorrent.com
 # LANGUAGE: pt_BR
@@ -11,6 +11,7 @@ import socket
 import ssl
 import sys
 import unicodedata
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Dict, List, Mapping, Set, Tuple, Union
 from urllib.parse import quote_plus, unquote, urljoin, urlsplit
@@ -36,6 +37,20 @@ INFO_AREA_CLASS = 'infos'
 UNKNOWN_SIZE = '-1'
 UNKNOWN_COUNT = -1
 UNKNOWN_DATE = -1
+MONTHS_PT_BR = {
+    'janeiro': 1,
+    'fevereiro': 2,
+    'marco': 3,
+    'abril': 4,
+    'maio': 5,
+    'junho': 6,
+    'julho': 7,
+    'agosto': 8,
+    'setembro': 9,
+    'outubro': 10,
+    'novembro': 11,
+    'dezembro': 12,
+}
 
 
 def attrs_to_dict(attrs: List[Tuple[str, Union[str, None]]]) -> Dict[str, str]:
@@ -104,6 +119,24 @@ def format_size_for_qbt(size_text: str) -> str:
     number = match.group(1).replace(',', '.')
     unit = match.group(2).upper()
     return number + ' ' + unit
+
+
+def format_pub_date_for_qbt(date_text: str) -> int:
+    """Convert Portuguese publication dates to the Unix timestamp qBittorrent expects."""
+    normalized = normalize_text(date_text)
+    match = re.search(r'(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})', normalized)
+
+    if not match:
+        return UNKNOWN_DATE
+
+    day = int(match.group(1))
+    month = MONTHS_PT_BR.get(match.group(2), 0)
+    year = int(match.group(3))
+
+    if not month:
+        return UNKNOWN_DATE
+
+    return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp())
 
 
 def decode_html(raw_content: bytes, content_type: str = '') -> str:
@@ -409,8 +442,14 @@ class apachetorrent:
             if not self._result_matches_category(result.get('title', ''), cat):
                 continue
 
-            prettyPrinter(self._build_search_result_info(result))
-            printed_count += 1
+            remaining = MAX_RESULTS - printed_count
+            detail_count = self._print_detail_page_results(result, remaining)
+
+            if detail_count:
+                printed_count += detail_count
+            else:
+                prettyPrinter(self._build_search_result_info(result))
+                printed_count += 1
 
             if printed_count >= MAX_RESULTS:
                 break
@@ -686,7 +725,7 @@ class apachetorrent:
             'leech': UNKNOWN_COUNT,
             'engine_url': self.url,
             'desc_link': result.get('desc_link', ''),
-            'pub_date': parser.published_at or UNKNOWN_DATE,
+            'pub_date': format_pub_date_for_qbt(parser.published_at),
         }
 
     def _build_result_name(
