@@ -1,4 +1,4 @@
-# VERSION: 1.25
+# VERSION: 1.26
 # AUTHORS: bebetoh, mvsantss
 # WEBSITE: https://apachetorrent.com
 # LANGUAGE: pt_BR
@@ -22,7 +22,7 @@ from novaprinter import prettyPrinter
 
 
 BASE_URL = 'https://apachetorrent.com'
-MAX_RESULTS = 20
+MAX_RESULTS = 50
 REQUEST_TIMEOUT = 20
 PUBLIC_DNS_URL = 'https://dns.google/resolve?name={host}&type=A'
 USER_AGENT = (

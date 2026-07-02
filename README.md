@@ -20,6 +20,7 @@ Use apenas para pesquisar conteudo que voce tem direito de acessar no seu pais.
 - A busca lista os cards imediatamente; o link magnet e resolvido apenas ao solicitar o download.
 - A busca detalhada tenta preencher tamanho, data de publicacao e link magnet diretamente nos resultados.
 - Seeders e leechers ficam como desconhecidos porque o ApacheTorrent nao publica estes numeros.
+- Limite de resultados aumentado para 50.
 
 ## Instalar pelo arquivo local
 
