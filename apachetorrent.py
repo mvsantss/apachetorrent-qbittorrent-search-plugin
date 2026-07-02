@@ -1,16 +1,20 @@
-# VERSION: 1.20
+# VERSION: 1.22
 # AUTHORS: bebetoh, mvsantss
 # WEBSITE: https://apachetorrent.com
 # LANGUAGE: pt_BR
 # DESCRIPTION: qBittorrent search plugin for ApacheTorrent. Use only for content you have the right to download.
 
 import html
+import json
 import re
+import socket
+import ssl
 import sys
 import unicodedata
 from html.parser import HTMLParser
 from typing import Dict, List, Mapping, Set, Tuple, Union
-from urllib.parse import quote_plus, unquote, urljoin
+from urllib.parse import quote_plus, unquote, urljoin, urlsplit
+from urllib.request import Request, urlopen
 
 from helpers import retrieve_url
 from novaprinter import prettyPrinter
@@ -18,6 +22,12 @@ from novaprinter import prettyPrinter
 
 BASE_URL = 'https://apachetorrent.com'
 MAX_RESULTS = 20
+REQUEST_TIMEOUT = 20
+PUBLIC_DNS_URL = 'https://dns.google/resolve?name={host}&type=A'
+USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36'
+)
 
 RESULT_CARD_CLASS = 'capaname'
 DOWNLOAD_AREA_ID = 'lista_links'
@@ -94,6 +104,23 @@ def format_size_for_qbt(size_text: str) -> str:
     number = match.group(1).replace(',', '.')
     unit = match.group(2).upper()
     return number + ' ' + unit
+
+
+def decode_html(raw_content: bytes, content_type: str = '') -> str:
+    """Decode ApacheTorrent pages, correcting occasional wrong charset headers."""
+    charset_match = re.search(r'charset=([\w-]+)', content_type or '', flags=re.IGNORECASE)
+    charset = charset_match.group(1) if charset_match else 'utf-8'
+    decoded = raw_content.decode(charset, errors='replace')
+
+    if '\ufffd' not in decoded:
+        return decoded
+
+    windows_decoded = raw_content.decode('windows-1252', errors='replace')
+
+    if windows_decoded.count('\ufffd') < decoded.count('\ufffd'):
+        return windows_decoded
+
+    return decoded
 
 
 class SearchResultsParser(HTMLParser):
@@ -396,8 +423,146 @@ class apachetorrent:
         try:
             return retrieve_url(url)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            print(f'ApacheTorrent {context} request failed: {exc}', file=sys.stderr)
-            return ''
+            print(f'ApacheTorrent {context} request failed with qBittorrent helper: {exc}', file=sys.stderr)
+
+        return self._retrieve_with_ssl_fallback(url, context)
+
+    def _retrieve_with_ssl_fallback(self, url: str, context: str) -> str:
+        # ApacheTorrent can present a certificate that fails Python hostname
+        # validation. Browsers may still open it, but qBittorrent's helper can
+        # return no results. This fallback reads only the HTML needed to search.
+        ssl_context = ssl._create_unverified_context()  # pylint: disable=protected-access
+        request = Request(url, headers={'User-Agent': USER_AGENT})
+
+        try:
+            with urlopen(request, timeout=REQUEST_TIMEOUT, context=ssl_context) as response:
+                content_type = response.headers.get('content-type', '')
+                content = decode_html(response.read(), content_type)
+
+                if not self._looks_like_provider_block(content):
+                    return content
+
+                print(f'ApacheTorrent {context} request reached provider block page', file=sys.stderr)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f'ApacheTorrent {context} request failed with SSL fallback: {exc}', file=sys.stderr)
+
+        return self._retrieve_with_direct_ip_fallback(url, context)
+
+    def _retrieve_with_direct_ip_fallback(self, url: str, context: str) -> str:
+        # Some networks poison the system DNS entry for apachetorrent.com. Resolve
+        # with public DNS, then connect to the real Cloudflare IP while keeping
+        # the original hostname in TLS SNI and the HTTP Host header.
+        parsed = urlsplit(url)
+        host = parsed.hostname or ''
+
+        for ip_address in self._resolve_public_a_records(host):
+            try:
+                content = self._https_get_via_ip(url, ip_address)
+
+                if content and not self._looks_like_provider_block(content):
+                    return content
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                print(f'ApacheTorrent {context} direct IP request failed for {ip_address}: {exc}', file=sys.stderr)
+
+        return ''
+
+    def _resolve_public_a_records(self, host: str) -> List[str]:
+        if not host:
+            return []
+
+        dns_url = PUBLIC_DNS_URL.format(host=quote_plus(host))
+        request = Request(dns_url, headers={'Accept': 'application/dns-json', 'User-Agent': USER_AGENT})
+
+        try:
+            with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                data = json.loads(response.read().decode('utf-8', errors='replace'))
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f'ApacheTorrent public DNS lookup failed: {exc}', file=sys.stderr)
+            return []
+
+        answers = data.get('Answer', [])
+        return [
+            item.get('data', '')
+            for item in answers
+            if item.get('type') == 1 and item.get('data')
+        ]
+
+    def _https_get_via_ip(self, url: str, ip_address: str) -> str:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ''
+        path = parsed.path or '/'
+
+        if parsed.query:
+            path += '?' + parsed.query
+
+        ssl_context = ssl.create_default_context()
+
+        with socket.create_connection((ip_address, 443), timeout=REQUEST_TIMEOUT) as sock:
+            with ssl_context.wrap_socket(sock, server_hostname=host) as tls_socket:
+                request = (
+                    f'GET {path} HTTP/1.1\r\n'
+                    f'Host: {host}\r\n'
+                    f'User-Agent: {USER_AGENT}\r\n'
+                    'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n'
+                    'Connection: close\r\n\r\n'
+                )
+                tls_socket.sendall(request.encode('ascii'))
+                raw_response = self._read_all(tls_socket)
+
+        headers, body = self._split_http_response(raw_response)
+        status_line = headers.split('\r\n', 1)[0]
+
+        if ' 200 ' not in status_line:
+            raise RuntimeError(status_line)
+
+        if re.search(r'transfer-encoding:\s*chunked', headers, flags=re.IGNORECASE):
+            body = self._decode_chunked_body(body)
+
+        return decode_html(body, headers)
+
+    def _read_all(self, tls_socket: ssl.SSLSocket) -> bytes:
+        chunks = []
+
+        while True:
+            chunk = tls_socket.recv(65536)
+
+            if not chunk:
+                break
+
+            chunks.append(chunk)
+
+        return b''.join(chunks)
+
+    def _split_http_response(self, raw_response: bytes) -> Tuple[str, bytes]:
+        header_bytes, _, body = raw_response.partition(b'\r\n\r\n')
+        headers = header_bytes.decode('iso-8859-1', errors='replace')
+        return headers, body
+
+    def _decode_chunked_body(self, body: bytes) -> bytes:
+        decoded = bytearray()
+        position = 0
+
+        while True:
+            line_end = body.find(b'\r\n', position)
+
+            if line_end == -1:
+                break
+
+            size_line = body[position:line_end].split(b';', 1)[0]
+            chunk_size = int(size_line.strip() or b'0', 16)
+            position = line_end + 2
+
+            if chunk_size == 0:
+                break
+
+            decoded.extend(body[position:position + chunk_size])
+            position += chunk_size + 2
+
+        return bytes(decoded)
+
+    def _looks_like_provider_block(self, content: str) -> bool:
+        normalized = normalize_text(content)
+        return 'bloqueio.zaaztelecom' in normalized or 'bloqueio' in normalized[:3000]
 
     def _result_matches_category(self, title: str, cat: str) -> bool:
         if cat not in self.supported_categories or cat == 'all':

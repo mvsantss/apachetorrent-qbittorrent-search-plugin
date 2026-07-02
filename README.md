@@ -15,6 +15,8 @@ Use apenas para pesquisar conteudo que voce tem direito de acessar no seu pais.
 - Deduplicacao por link de detalhe e hash magnet.
 - Filtro basico por categoria: filmes, series e anime/desenho.
 - Extracao de tamanho, qualidade, idioma e formato quando a pagina informa.
+- Fallback para DNS publico quando o DNS da maquina aponta o dominio para pagina de bloqueio.
+- Fallback de conexao HTTPS direta com SNI correto quando o helper do qBittorrent falha por SSL.
 
 ## Instalar pelo arquivo local
 
