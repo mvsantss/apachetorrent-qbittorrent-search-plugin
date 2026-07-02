@@ -1,4 +1,4 @@
-# VERSION: 1.22
+# VERSION: 1.24
 # AUTHORS: bebetoh, mvsantss
 # WEBSITE: https://apachetorrent.com
 # LANGUAGE: pt_BR
@@ -409,11 +409,30 @@ class apachetorrent:
             if not self._result_matches_category(result.get('title', ''), cat):
                 continue
 
-            remaining = MAX_RESULTS - printed_count
-            printed_count += self._print_detail_page_results(result, remaining)
+            prettyPrinter(self._build_search_result_info(result))
+            printed_count += 1
 
             if printed_count >= MAX_RESULTS:
                 break
+
+    def download_torrent(self, info: str) -> None:
+        details_html = self._retrieve(info, 'download')
+
+        if not details_html:
+            raise ValueError('ApacheTorrent download page could not be loaded')
+
+        parser = DetailsParser()
+        parser.feed(details_html)
+        parser.close()
+
+        for magnet_item in parser.magnets:
+            magnet = magnet_item.get('magnet', '')
+
+            if magnet:
+                print(magnet + ' ' + info)
+                return
+
+        raise ValueError('ApacheTorrent magnet link not found')
 
     def _build_search_url(self, what: str) -> str:
         query = unquote(what or '').replace('+', ' ')
@@ -421,7 +440,12 @@ class apachetorrent:
 
     def _retrieve(self, url: str, context: str) -> str:
         try:
-            return retrieve_url(url)
+            content = retrieve_url(url)
+
+            if content and not self._looks_like_failed_response(content):
+                return content
+
+            print(f'ApacheTorrent {context} request returned invalid helper response', file=sys.stderr)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             print(f'ApacheTorrent {context} request failed with qBittorrent helper: {exc}', file=sys.stderr)
 
@@ -564,6 +588,17 @@ class apachetorrent:
         normalized = normalize_text(content)
         return 'bloqueio.zaaztelecom' in normalized or 'bloqueio' in normalized[:3000]
 
+    def _looks_like_failed_response(self, content: str) -> bool:
+        normalized = normalize_text(content)
+
+        if not normalized.strip():
+            return True
+
+        if normalized.lstrip().startswith('connection error:'):
+            return True
+
+        return self._looks_like_provider_block(content)
+
     def _result_matches_category(self, title: str, cat: str) -> bool:
         if cat not in self.supported_categories or cat == 'all':
             return True
@@ -620,6 +655,20 @@ class apachetorrent:
                 break
 
         return printed_count
+
+    def _build_search_result_info(self, result: Mapping[str, str]) -> Dict[str, Union[str, int]]:
+        desc_link = result.get('desc_link', '')
+
+        return {
+            'link': desc_link,
+            'name': clean_result_title(result.get('title', '')),
+            'size': UNKNOWN_SIZE,
+            'seeds': UNKNOWN_COUNT,
+            'leech': UNKNOWN_COUNT,
+            'engine_url': self.url,
+            'desc_link': desc_link,
+            'pub_date': UNKNOWN_DATE,
+        }
 
     def _build_torrent_info(
         self,
