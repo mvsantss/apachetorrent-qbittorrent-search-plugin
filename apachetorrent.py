@@ -1,0 +1,509 @@
+# VERSION: 1.20
+# AUTHORS: bebetoh, mvsantss
+# WEBSITE: https://apachetorrent.com
+# LANGUAGE: pt_BR
+# DESCRIPTION: qBittorrent search plugin for ApacheTorrent. Use only for content you have the right to download.
+
+import html
+import re
+import sys
+import unicodedata
+from html.parser import HTMLParser
+from typing import Dict, List, Mapping, Set, Tuple, Union
+from urllib.parse import quote_plus, unquote, urljoin
+
+from helpers import retrieve_url
+from novaprinter import prettyPrinter
+
+
+BASE_URL = 'https://apachetorrent.com'
+MAX_RESULTS = 20
+
+RESULT_CARD_CLASS = 'capaname'
+DOWNLOAD_AREA_ID = 'lista_links'
+INFO_AREA_CLASS = 'infos'
+
+UNKNOWN_SIZE = '-1'
+UNKNOWN_COUNT = -1
+UNKNOWN_DATE = -1
+
+
+def attrs_to_dict(attrs: List[Tuple[str, Union[str, None]]]) -> Dict[str, str]:
+    """Convert HTMLParser attrs into a predictable dictionary."""
+    result = {}
+
+    for key, value in attrs:
+        result[key] = value if value is not None else ''
+
+    return result
+
+
+def clean_text(text: str) -> str:
+    """Decode entities and collapse whitespace from scraped HTML text."""
+    text = html.unescape(text or '')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def normalize_text(text: str) -> str:
+    """Lowercase and remove accents for category checks and label matching."""
+    normalized = unicodedata.normalize('NFKD', text or '')
+    ascii_text = normalized.encode('ascii', 'ignore').decode('ascii')
+    return ascii_text.lower()
+
+
+def clean_result_title(title: str) -> str:
+    """Remove repetitive action words that make qBittorrent results noisy."""
+    title = clean_text(title)
+    title = re.sub(r'^BAIXAR\s+', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\bDOWNLOAD\s+TORRENT\b', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\bDOWNLOAD\b', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\bTORRENT\b', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s+', ' ', title)
+    return title.strip(' -')
+
+
+def extract_info_hash(magnet: str) -> str:
+    match = re.search(r'xt=urn:btih:([^&]+)', magnet or '', flags=re.IGNORECASE)
+
+    if not match:
+        return ''
+
+    return match.group(1).upper()
+
+
+def extract_magnet_name(magnet: str) -> str:
+    match = re.search(r'[?&]dn=([^&]+)', magnet or '')
+
+    if not match:
+        return ''
+
+    name = unquote(match.group(1))
+    name = name.replace('.', ' ')
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()
+
+
+def format_size_for_qbt(size_text: str) -> str:
+    """qBittorrent accepts human-readable sizes from search plugins."""
+    match = re.search(r'([\d.,]+)\s*(GB|MB|KB|B)', size_text or '', flags=re.IGNORECASE)
+
+    if not match:
+        return UNKNOWN_SIZE
+
+    number = match.group(1).replace(',', '.')
+    unit = match.group(2).upper()
+    return number + ' ' + unit
+
+
+class SearchResultsParser(HTMLParser):
+    """Parse search result cards and keep only detail-page links."""
+
+    def __init__(self, base_url: str) -> None:
+        HTMLParser.__init__(self)
+        self.base_url = base_url
+        self.results: List[Dict[str, str]] = []
+
+        self.inside_card = False
+        self.card_depth = 0
+        self.inside_title_link = False
+        self.current_link = ''
+        self.current_title = ''
+        self.current_title_attr = ''
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Union[str, None]]]) -> None:
+        params = attrs_to_dict(attrs)
+
+        if tag == 'div' and RESULT_CARD_CLASS in params.get('class', '').split():
+            self._start_card()
+            return
+
+        if not self.inside_card:
+            return
+
+        if tag == 'div':
+            self.card_depth += 1
+
+        if tag == 'a':
+            self._capture_result_link(params)
+
+    def handle_data(self, data: str) -> None:
+        if not self.inside_card or not self.inside_title_link:
+            return
+
+        text = clean_text(data)
+
+        if not text:
+            return
+
+        if self.current_title:
+            self.current_title += ' '
+
+        self.current_title += text
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == 'a' and self.inside_title_link:
+            self.inside_title_link = False
+
+        if tag != 'div' or not self.inside_card:
+            return
+
+        self.card_depth -= 1
+
+        if self.card_depth <= 0:
+            self._finish_card()
+
+    def _start_card(self) -> None:
+        self.inside_card = True
+        self.card_depth = 1
+        self.inside_title_link = False
+        self.current_link = ''
+        self.current_title = ''
+        self.current_title_attr = ''
+
+    def _capture_result_link(self, params: Mapping[str, str]) -> None:
+        href = params.get('href', '')
+
+        if not self._is_result_link(href):
+            return
+
+        self.current_link = urljoin(self.base_url, href)
+        self.current_title_attr = clean_result_title(params.get('title', ''))
+        self.inside_title_link = True
+
+    def _finish_card(self) -> None:
+        title = clean_result_title(self.current_title or self.current_title_attr)
+
+        if self.current_link and title:
+            self.results.append({
+                'title': title,
+                'desc_link': self.current_link,
+            })
+
+        self.inside_card = False
+        self.card_depth = 0
+        self.inside_title_link = False
+        self.current_link = ''
+        self.current_title = ''
+        self.current_title_attr = ''
+
+    def _is_result_link(self, href: str) -> bool:
+        absolute_url = urljoin(self.base_url, href or '')
+        url_lower = absolute_url.lower()
+
+        return url_lower.startswith(self.base_url) and 'baixar-torrent' in url_lower
+
+
+class DetailsParser(HTMLParser):
+    """Parse a detail page for magnet links and optional metadata."""
+
+    info_labels = [
+        'Lancamento',
+        'Generos',
+        'Idioma',
+        'Duracao',
+        'Classificacao',
+        'Nota da Critica',
+        'Qualidade',
+        'Formato',
+        'Tamanho',
+        'Video',
+        'Servidores de Download',
+    ]
+
+    def __init__(self) -> None:
+        HTMLParser.__init__(self)
+        self.magnets: List[Dict[str, str]] = []
+        self.info: Dict[str, str] = {}
+        self.published_at = ''
+
+        self.inside_download_area = False
+        self.download_depth = 0
+        self.capture_download_text = False
+        self.current_download_text = ''
+
+        self.inside_info_area = False
+        self.info_depth = 0
+        self.info_text = ''
+
+        self.expect_publication_date = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Union[str, None]]]) -> None:
+        params = attrs_to_dict(attrs)
+
+        if tag == 'div' and params.get('id') == DOWNLOAD_AREA_ID:
+            self._start_download_area()
+            return
+
+        if tag == 'div' and INFO_AREA_CLASS in params.get('class', '').split():
+            self._start_info_area()
+            return
+
+        if self.inside_download_area:
+            self._handle_download_starttag(tag, params)
+
+        if self.inside_info_area and tag == 'div':
+            self.info_depth += 1
+
+    def handle_data(self, data: str) -> None:
+        text = clean_text(data)
+
+        if not text:
+            return
+
+        if self.inside_download_area and self.capture_download_text:
+            self.current_download_text = self._append_text(self.current_download_text, text)
+
+        if self.inside_info_area:
+            self.info_text = self._append_text(self.info_text, text)
+
+        self._capture_publication_date(text)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == 'p' and self.capture_download_text:
+            self.capture_download_text = False
+            self.current_download_text = ''
+
+        if tag == 'div' and self.inside_download_area:
+            self.download_depth -= 1
+
+            if self.download_depth <= 0:
+                self.inside_download_area = False
+
+        if tag == 'div' and self.inside_info_area:
+            self.info_depth -= 1
+
+            if self.info_depth <= 0:
+                self.inside_info_area = False
+                self.info = self._parse_info_text(self.info_text)
+
+    def _start_download_area(self) -> None:
+        self.inside_download_area = True
+        self.download_depth = 1
+        self.capture_download_text = False
+        self.current_download_text = ''
+
+    def _start_info_area(self) -> None:
+        self.inside_info_area = True
+        self.info_depth = 1
+        self.info_text = ''
+
+    def _handle_download_starttag(self, tag: str, params: Mapping[str, str]) -> None:
+        if tag == 'div':
+            self.download_depth += 1
+
+        if tag == 'p':
+            self.capture_download_text = True
+            self.current_download_text = ''
+
+        if tag != 'a':
+            return
+
+        href = params.get('href', '')
+
+        if not href.startswith('magnet:?'):
+            return
+
+        self.magnets.append({
+            'magnet': html.unescape(href),
+            'title': clean_result_title(params.get('title', '') or self.current_download_text),
+        })
+
+    def _capture_publication_date(self, text: str) -> None:
+        if 'data de publica' in normalize_text(text):
+            self.expect_publication_date = True
+            return
+
+        if self.expect_publication_date:
+            self.published_at = text
+            self.expect_publication_date = False
+
+    def _parse_info_text(self, text: str) -> Dict[str, str]:
+        fields = {}
+        normalized = normalize_text(text)
+
+        # The page renders labels as plain text after <strong> tags. This regex
+        # extracts each label until the next known label.
+        for index, label in enumerate(self.info_labels):
+            label_key = normalize_text(label)
+            next_labels = [normalize_text(item) for item in self.info_labels[index + 1:]]
+            pattern = re.escape(label_key) + r'\s*:\s*(.*?)'
+
+            if next_labels:
+                pattern += r'(?=\s+(?:' + '|'.join(re.escape(item) for item in next_labels) + r')\s*:|$)'
+            else:
+                pattern += r'$'
+
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+
+            if match:
+                fields[label_key] = match.group(1).strip()
+
+        return fields
+
+    def _append_text(self, current: str, text: str) -> str:
+        if current:
+            return current + ' ' + text
+
+        return text
+
+
+class apachetorrent:
+    url = BASE_URL
+    name = 'ApacheTorrent'
+    supported_categories = {
+        'all': 'all',
+        'movies': 'movies',
+        'tv': 'tv',
+        'anime': 'anime',
+    }
+
+    def search(self, what: str, cat: str = 'all') -> None:
+        search_html = self._retrieve(self._build_search_url(what), 'search')
+
+        if not search_html:
+            return
+
+        parser = SearchResultsParser(self.url)
+        parser.feed(search_html)
+        parser.close()
+
+        printed_count = 0
+        seen_desc_links: Set[str] = set()
+
+        for result in parser.results:
+            desc_link = result.get('desc_link', '')
+
+            if not desc_link or desc_link in seen_desc_links:
+                continue
+
+            seen_desc_links.add(desc_link)
+
+            if not self._result_matches_category(result.get('title', ''), cat):
+                continue
+
+            remaining = MAX_RESULTS - printed_count
+            printed_count += self._print_detail_page_results(result, remaining)
+
+            if printed_count >= MAX_RESULTS:
+                break
+
+    def _build_search_url(self, what: str) -> str:
+        query = unquote(what or '').replace('+', ' ')
+        return self.url + '/index.php?s=' + quote_plus(query)
+
+    def _retrieve(self, url: str, context: str) -> str:
+        try:
+            return retrieve_url(url)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f'ApacheTorrent {context} request failed: {exc}', file=sys.stderr)
+            return ''
+
+    def _result_matches_category(self, title: str, cat: str) -> bool:
+        if cat not in self.supported_categories or cat == 'all':
+            return True
+
+        normalized = normalize_text(title)
+
+        if cat == 'movies':
+            return 'filme' in normalized
+
+        if cat == 'tv':
+            return 'serie' in normalized or 'temporada' in normalized or 'minisserie' in normalized
+
+        if cat == 'anime':
+            return 'anime' in normalized or 'desenho' in normalized
+
+        return True
+
+    def _print_detail_page_results(self, result: Mapping[str, str], limit: int) -> int:
+        desc_link = result.get('desc_link', '')
+
+        if not desc_link or limit <= 0:
+            return 0
+
+        details_html = self._retrieve(desc_link, 'details')
+
+        if not details_html:
+            return 0
+
+        parser = DetailsParser()
+        parser.feed(details_html)
+        parser.close()
+
+        printed_count = 0
+        seen_hashes: Set[str] = set()
+
+        for magnet_item in parser.magnets:
+            magnet = magnet_item.get('magnet', '')
+
+            if not magnet:
+                continue
+
+            info_hash = extract_info_hash(magnet)
+
+            if info_hash and info_hash in seen_hashes:
+                continue
+
+            if info_hash:
+                seen_hashes.add(info_hash)
+
+            prettyPrinter(self._build_torrent_info(result, magnet_item, parser))
+            printed_count += 1
+
+            if printed_count >= limit:
+                break
+
+        return printed_count
+
+    def _build_torrent_info(
+        self,
+        result: Mapping[str, str],
+        magnet_item: Mapping[str, str],
+        parser: DetailsParser,
+    ) -> Dict[str, Union[str, int]]:
+        magnet = magnet_item.get('magnet', '')
+
+        return {
+            'link': magnet,
+            'name': self._build_result_name(result.get('title', ''), magnet_item.get('title', ''), magnet, parser.info),
+            'size': format_size_for_qbt(parser.info.get('tamanho', '')),
+            'seeds': UNKNOWN_COUNT,
+            'leech': UNKNOWN_COUNT,
+            'engine_url': self.url,
+            'desc_link': result.get('desc_link', ''),
+            'pub_date': parser.published_at or UNKNOWN_DATE,
+        }
+
+    def _build_result_name(
+        self,
+        base_title: str,
+        magnet_title: str,
+        magnet: str,
+        info: Mapping[str, str],
+    ) -> str:
+        parts = [clean_result_title(base_title)]
+        magnet_label = clean_result_title(magnet_title)
+
+        # Avoid repeating the page title when the button title already includes it.
+        if magnet_label and normalize_text(magnet_label) not in normalize_text(base_title):
+            parts.append(magnet_label)
+
+        details = ' / '.join(item for item in [
+            info.get('qualidade', ''),
+            info.get('idioma', ''),
+            info.get('formato', ''),
+        ] if item)
+
+        if details:
+            parts.append(details)
+
+        if len(parts) == 1:
+            magnet_name = extract_magnet_name(magnet)
+
+            if magnet_name:
+                parts.append(magnet_name)
+
+        name = ' - '.join(item for item in parts if item)
+        name = re.sub(r'\s+', ' ', name)
+        return name.strip(' -')
